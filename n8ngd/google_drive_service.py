@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -13,7 +14,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from n8ngd.app_paths import get_app_data_directory
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
 GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
@@ -175,7 +176,7 @@ class GoogleDriveService:
         lines = [
             f"Name: {item.name}",
             f"Type: {item.mime_type}",
-            f"Modified: {item.modified_time or 'Unknown'}",
+            f"Modified: {self._format_modified_time(item.modified_time)}",
             f"Size: {item.size if item.size is not None else 'Unknown'}",
             "",
             body,
@@ -188,3 +189,14 @@ class GoogleDriveService:
 
     def _get_token_path(self) -> Path:
         return get_app_data_directory() / "google_drive_token.json"
+
+    def _format_modified_time(self, modified_time: str | None) -> str:
+        if not modified_time:
+            return "Unknown"
+
+        try:
+            timestamp = datetime.fromisoformat(modified_time.replace("Z", "+00:00"))
+        except ValueError:
+            return modified_time.replace(",", ".")
+
+        return timestamp.strftime("%Y-%m-%d %H:%M:%S.%f %Z").rstrip("0").rstrip(".")

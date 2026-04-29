@@ -57,3 +57,9 @@ class SettingsService:
 
     def set_google_selected_drive_id(self, drive_id: str) -> None:
         self._settings.setValue("google_drive/selected_drive_id", drive_id)
+
+    def get_font_size(self) -> int:
+        return self._settings.value("appearance/font_size", 10, type=int)
+
+    def set_font_size(self, font_size: int) -> None:
+        self._settings.setValue("appearance/font_size", font_size)

@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from n8ngd import APP_NAME, __version__
+from n8ngd.app_paths import get_logo_path
 from n8ngd.file_service import list_files, normalize_folder_path
 from n8ngd.google_drive_service import DriveItem, DriveOption, GoogleDriveService
 from n8ngd.logging_service import LogEmitter
@@ -45,6 +47,26 @@ class UploadWorker(QObject):
         self.finished.emit(result)
 
 
+class GoogleDriveConnectWorker(QObject):
+    connected = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, drive_service: GoogleDriveService, credentials_path: str) -> None:
+        super().__init__()
+        self._drive_service = drive_service
+        self._credentials_path = credentials_path
+
+    def run(self) -> None:
+        try:
+            self._drive_service.connect(self._credentials_path)
+            drives = self._drive_service.list_drives()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        self.connected.emit(drives)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, logger: logging.Logger, log_emitter: LogEmitter, log_file_path: Path) -> None:
         super().__init__()
@@ -57,9 +79,14 @@ class MainWindow(QMainWindow):
         self.google_folder_stack: list[tuple[str, str]] = []
         self._upload_thread: QThread | None = None
         self._upload_worker: UploadWorker | None = None
+        self._google_connect_thread: QThread | None = None
+        self._google_connect_worker: GoogleDriveConnectWorker | None = None
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(760, 520)
+        logo_path = get_logo_path()
+        if logo_path.exists():
+            self.setWindowIcon(QIcon(str(logo_path)))
 
         self.tabs = QTabWidget()
         self.files_tab = QWidget()
@@ -231,11 +258,16 @@ class MainWindow(QMainWindow):
         self.n8n_url_edit.setPlaceholderText("https://your-n8n-host/webhook/...")
         form_layout.addRow("N8N Webhook URL", self.n8n_url_edit)
 
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(8, 24)
+        form_layout.addRow("Font Size", self.font_size_spin)
+
         layout.addLayout(form_layout)
         layout.addStretch(1)
         self.settings_tab.setLayout(layout)
 
         self.n8n_url_edit.editingFinished.connect(self._save_webhook_url)
+        self.font_size_spin.valueChanged.connect(self._save_font_size)
 
     def _build_log_tab(self) -> None:
         layout = QVBoxLayout()
@@ -273,9 +305,14 @@ class MainWindow(QMainWindow):
         last_folder = self.settings_service.get_last_folder_path()
         webhook_url = self.settings_service.get_n8n_webhook_url()
         google_credentials_path = self.settings_service.get_google_credentials_path()
+        font_size = self.settings_service.get_font_size()
         self.folder_path_edit.setText(last_folder)
         self.n8n_url_edit.setText(webhook_url)
         self.google_credentials_edit.setText(google_credentials_path)
+        self.font_size_spin.blockSignals(True)
+        self.font_size_spin.setValue(font_size)
+        self.font_size_spin.blockSignals(False)
+        self._apply_font_size(font_size)
         if last_folder:
             self.refresh_files()
         else:
@@ -298,6 +335,11 @@ class MainWindow(QMainWindow):
         self.settings_service.set_google_credentials_path(credentials_path)
         if credentials_path:
             self.logger.info("Saved Google credentials path: %s", credentials_path)
+
+    def _save_font_size(self, font_size: int) -> None:
+        self.settings_service.set_font_size(font_size)
+        self._apply_font_size(font_size)
+        self.logger.info("Font size set to %s", font_size)
 
     def _choose_folder(self) -> None:
         current = self.folder_path_edit.text().strip()
@@ -416,17 +458,38 @@ class MainWindow(QMainWindow):
             return
 
         self._save_google_credentials_path()
-        try:
-            self.google_drive_service.connect(credentials_path)
-            drives = self.google_drive_service.list_drives()
-        except Exception as exc:
-            self.logger.exception("Google Drive connection failed.")
-            self._set_google_drive_status(f"Google Drive connection failed: {exc}", is_error=True)
+        self.google_connect_button.setEnabled(False)
+        self.google_credentials_browse_button.setEnabled(False)
+        self.google_drive_combo.setEnabled(False)
+        self.google_refresh_button.setEnabled(False)
+        self.google_up_button.setEnabled(False)
+        self._set_google_drive_status("Connecting to Google Drive with full Drive access...", is_error=False)
+        self.logger.info("Starting Google Drive connection.")
+
+        self._google_connect_thread = QThread(self)
+        self._google_connect_worker = GoogleDriveConnectWorker(self.google_drive_service, credentials_path)
+        self._google_connect_worker.moveToThread(self._google_connect_thread)
+        self._google_connect_thread.started.connect(self._google_connect_worker.run)
+        self._google_connect_worker.connected.connect(self._finish_google_drive_connect)
+        self._google_connect_worker.failed.connect(self._fail_google_drive_connect)
+        self._google_connect_worker.connected.connect(self._google_connect_thread.quit)
+        self._google_connect_worker.failed.connect(self._google_connect_thread.quit)
+        self._google_connect_worker.connected.connect(self._google_connect_worker.deleteLater)
+        self._google_connect_worker.failed.connect(self._google_connect_worker.deleteLater)
+        self._google_connect_thread.finished.connect(self._google_connect_thread.deleteLater)
+        self._google_connect_thread.finished.connect(self._clear_google_connect_refs)
+        self._google_connect_thread.start()
+
+    def _finish_google_drive_connect(self, drives: object) -> None:
+        if not isinstance(drives, list):
+            self._fail_google_drive_connect("Unexpected Google Drive response.")
             return
 
         self.google_drive_combo.blockSignals(True)
         self.google_drive_combo.clear()
         for drive in drives:
+            if not isinstance(drive, DriveOption):
+                continue
             label = drive.name if not drive.is_shared_drive else f"{drive.name} (Shared Drive)"
             self.google_drive_combo.addItem(label, drive)
         self.google_drive_combo.blockSignals(False)
@@ -445,7 +508,17 @@ class MainWindow(QMainWindow):
         self.google_drive_combo.setCurrentIndex(selected_index)
         self._google_drive_changed(selected_index)
         self.logger.info("Connected to Google Drive.")
-        self._set_google_drive_status("Connected to Google Drive.", is_error=False)
+        self._set_google_drive_status("Connected to Google Drive with full Drive access.", is_error=False)
+
+    def _fail_google_drive_connect(self, error_message: str) -> None:
+        self.logger.error("Google Drive connection failed. %s", error_message)
+        self._set_google_drive_status(f"Google Drive connection failed: {error_message}", is_error=True)
+
+    def _clear_google_connect_refs(self) -> None:
+        self._google_connect_worker = None
+        self._google_connect_thread = None
+        self.google_connect_button.setEnabled(True)
+        self.google_credentials_browse_button.setEnabled(True)
 
     def _google_drive_changed(self, index: int) -> None:
         drive = self.google_drive_combo.itemData(index)
@@ -601,6 +674,21 @@ class MainWindow(QMainWindow):
         color = "#9b1c1c" if is_error else "#1f4d2e"
         self.status_label.setStyleSheet(f"color: {color};")
         self.status_label.setText(message)
+
+    def _apply_font_size(self, font_size: int) -> None:
+        app = self.window().windowHandle()
+        del app
+        qt_app = self.parent()
+        del qt_app
+        from PySide6.QtWidgets import QApplication
+
+        application = QApplication.instance()
+        if application is None:
+            return
+
+        font = application.font()
+        font.setPointSize(font_size)
+        application.setFont(font)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.settings_service.set_window_geometry(self.saveGeometry())

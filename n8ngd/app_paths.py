@@ -17,3 +17,7 @@ def get_app_data_directory() -> Path:
         return app_data_path.parent
 
     return app_data_path
+
+
+def get_logo_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "logo 180.png"

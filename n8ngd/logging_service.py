@@ -24,6 +24,10 @@ class QtLogHandler(logging.Handler):
         self._emitter.message_logged.emit(message)
 
 
+class DotMillisFormatter(logging.Formatter):
+    default_msec_format = "%s.%03d"
+
+
 def get_log_directory() -> Path:
     log_dir = get_app_data_directory() / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -45,7 +49,7 @@ def configure_logging() -> tuple[logging.Logger, LogEmitter, Path]:
         handler.close()
 
     emitter = LogEmitter()
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    formatter = DotMillisFormatter("%(asctime)s [%(levelname)s] %(message)s")
     log_file_path = get_log_file_path()
 
     file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
