@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -17,13 +18,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from n8ngd import __version__
+from n8ngd import APP_NAME, __version__
 from n8ngd.file_service import list_files, normalize_folder_path
+from n8ngd.google_drive_service import DriveItem, DriveOption, GoogleDriveService
 from n8ngd.logging_service import LogEmitter
 from n8ngd.settings_service import SettingsService
 from n8ngd.upload_service import UploadResult, upload_file, validate_webhook_url
@@ -49,22 +52,28 @@ class MainWindow(QMainWindow):
         self.log_emitter = log_emitter
         self.log_file_path = log_file_path
         self.settings_service = SettingsService()
+        self.google_drive_service = GoogleDriveService()
+        self.google_current_drive: DriveOption | None = None
+        self.google_folder_stack: list[tuple[str, str]] = []
         self._upload_thread: QThread | None = None
         self._upload_worker: UploadWorker | None = None
 
-        self.setWindowTitle("n8ngd")
+        self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(760, 520)
 
         self.tabs = QTabWidget()
         self.files_tab = QWidget()
+        self.google_drive_tab = QWidget()
         self.settings_tab = QWidget()
         self.log_tab = QWidget()
 
         self._build_files_tab()
+        self._build_google_drive_tab()
         self._build_settings_tab()
         self._build_log_tab()
 
         self.tabs.addTab(self.files_tab, "Files")
+        self.tabs.addTab(self.google_drive_tab, "Google Drive")
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.log_tab, "Log")
         self.setCentralWidget(self.tabs)
@@ -91,6 +100,30 @@ class MainWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QListWidget.SingleSelection)
 
+        file_panel = QWidget()
+        file_panel_layout = QVBoxLayout()
+        file_panel_layout.setContentsMargins(0, 0, 0, 0)
+        file_panel_layout.addWidget(self.file_list)
+        file_panel.setLayout(file_panel_layout)
+
+        self.file_preview = QPlainTextEdit()
+        self.file_preview.setReadOnly(True)
+        self.file_preview.setPlaceholderText("Select a file to preview its contents.")
+
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout()
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(QLabel("Selected file contents"))
+        preview_layout.addWidget(self.file_preview)
+        preview_panel.setLayout(preview_layout)
+
+        self.files_splitter = QSplitter(Qt.Horizontal)
+        self.files_splitter.addWidget(file_panel)
+        self.files_splitter.addWidget(preview_panel)
+        self.files_splitter.setChildrenCollapsible(False)
+        self.files_splitter.setStretchFactor(0, 1)
+        self.files_splitter.setStretchFactor(1, 1)
+
         self.upload_button = QPushButton("Upload Selected File")
         self.upload_button.setEnabled(False)
 
@@ -99,7 +132,7 @@ class MainWindow(QMainWindow):
         self.status_label.setTextFormat(Qt.PlainText)
 
         layout.addLayout(controls_layout)
-        layout.addWidget(self.file_list, stretch=1)
+        layout.addWidget(self.files_splitter, stretch=1)
         layout.addWidget(self.upload_button)
         layout.addWidget(self.status_label)
 
@@ -110,7 +143,85 @@ class MainWindow(QMainWindow):
         self.open_folder_button.clicked.connect(self._open_folder)
         self.upload_button.clicked.connect(self._start_upload)
         self.file_list.itemSelectionChanged.connect(self._update_upload_state)
+        self.file_list.itemSelectionChanged.connect(self._update_file_preview)
+        self.file_list.currentItemChanged.connect(self._update_file_preview)
+        self.file_list.itemClicked.connect(self._update_file_preview)
         self.folder_path_edit.editingFinished.connect(self._save_folder_path)
+
+    def _build_google_drive_tab(self) -> None:
+        layout = QVBoxLayout()
+
+        auth_layout = QHBoxLayout()
+        self.google_credentials_edit = QLineEdit()
+        self.google_credentials_edit.setPlaceholderText("Path to Google OAuth client credentials JSON")
+        self.google_credentials_browse_button = QPushButton("Browse...")
+        self.google_connect_button = QPushButton("Connect")
+        auth_layout.addWidget(QLabel("Credentials"))
+        auth_layout.addWidget(self.google_credentials_edit, stretch=1)
+        auth_layout.addWidget(self.google_credentials_browse_button)
+        auth_layout.addWidget(self.google_connect_button)
+
+        nav_layout = QHBoxLayout()
+        self.google_drive_combo = QComboBox()
+        self.google_drive_combo.setEnabled(False)
+        self.google_up_button = QPushButton("Up")
+        self.google_up_button.setEnabled(False)
+        self.google_refresh_button = QPushButton("Refresh")
+        self.google_refresh_button.setEnabled(False)
+        self.google_folder_label = QLabel("Folder: Not connected")
+        self.google_folder_label.setTextFormat(Qt.PlainText)
+        nav_layout.addWidget(QLabel("Drive"))
+        nav_layout.addWidget(self.google_drive_combo, stretch=0)
+        nav_layout.addWidget(self.google_up_button)
+        nav_layout.addWidget(self.google_refresh_button)
+        nav_layout.addWidget(self.google_folder_label, stretch=1)
+
+        self.google_drive_list = QListWidget()
+        self.google_drive_list.setSelectionMode(QListWidget.SingleSelection)
+
+        drive_list_panel = QWidget()
+        drive_list_layout = QVBoxLayout()
+        drive_list_layout.setContentsMargins(0, 0, 0, 0)
+        drive_list_layout.addWidget(self.google_drive_list)
+        drive_list_panel.setLayout(drive_list_layout)
+
+        self.google_drive_preview = QPlainTextEdit()
+        self.google_drive_preview.setReadOnly(True)
+        self.google_drive_preview.setPlaceholderText("Select a Google Drive file to preview its contents.")
+
+        drive_preview_panel = QWidget()
+        drive_preview_layout = QVBoxLayout()
+        drive_preview_layout.setContentsMargins(0, 0, 0, 0)
+        drive_preview_layout.addWidget(QLabel("Selected Google Drive item"))
+        drive_preview_layout.addWidget(self.google_drive_preview)
+        drive_preview_panel.setLayout(drive_preview_layout)
+
+        self.google_drive_splitter = QSplitter(Qt.Horizontal)
+        self.google_drive_splitter.addWidget(drive_list_panel)
+        self.google_drive_splitter.addWidget(drive_preview_panel)
+        self.google_drive_splitter.setChildrenCollapsible(False)
+        self.google_drive_splitter.setStretchFactor(0, 1)
+        self.google_drive_splitter.setStretchFactor(1, 1)
+
+        self.google_drive_status_label = QLabel("")
+        self.google_drive_status_label.setWordWrap(True)
+        self.google_drive_status_label.setTextFormat(Qt.PlainText)
+
+        layout.addLayout(auth_layout)
+        layout.addLayout(nav_layout)
+        layout.addWidget(self.google_drive_splitter, stretch=1)
+        layout.addWidget(self.google_drive_status_label)
+        self.google_drive_tab.setLayout(layout)
+
+        self.google_credentials_browse_button.clicked.connect(self._choose_google_credentials)
+        self.google_connect_button.clicked.connect(self._connect_google_drive)
+        self.google_drive_combo.currentIndexChanged.connect(self._google_drive_changed)
+        self.google_refresh_button.clicked.connect(self._refresh_google_drive_items)
+        self.google_up_button.clicked.connect(self._google_navigate_up)
+        self.google_drive_list.itemSelectionChanged.connect(self._update_google_drive_preview)
+        self.google_drive_list.currentItemChanged.connect(self._update_google_drive_preview)
+        self.google_drive_list.itemDoubleClicked.connect(self._handle_google_drive_item_double_clicked)
+        self.google_credentials_edit.editingFinished.connect(self._save_google_credentials_path)
 
     def _build_settings_tab(self) -> None:
         layout = QVBoxLayout()
@@ -147,12 +258,28 @@ class MainWindow(QMainWindow):
         self.open_log_file_button.clicked.connect(self._open_log_file)
 
     def _load_settings(self) -> None:
+        window_geometry = self.settings_service.get_window_geometry()
+        if window_geometry:
+            self.restoreGeometry(window_geometry)
+
+        splitter_state = self.settings_service.get_files_splitter_state()
+        if splitter_state:
+            self.files_splitter.restoreState(splitter_state)
+
+        google_splitter_state = self.settings_service.get_google_drive_splitter_state()
+        if google_splitter_state:
+            self.google_drive_splitter.restoreState(google_splitter_state)
+
         last_folder = self.settings_service.get_last_folder_path()
         webhook_url = self.settings_service.get_n8n_webhook_url()
+        google_credentials_path = self.settings_service.get_google_credentials_path()
         self.folder_path_edit.setText(last_folder)
         self.n8n_url_edit.setText(webhook_url)
+        self.google_credentials_edit.setText(google_credentials_path)
         if last_folder:
             self.refresh_files()
+        else:
+            self.file_preview.setPlainText("")
 
     def _save_folder_path(self) -> None:
         folder_path = self.folder_path_edit.text().strip()
@@ -165,6 +292,12 @@ class MainWindow(QMainWindow):
         self.settings_service.set_n8n_webhook_url(webhook_url)
         if webhook_url:
             self.logger.info("Saved N8N webhook URL.")
+
+    def _save_google_credentials_path(self) -> None:
+        credentials_path = self.google_credentials_edit.text().strip()
+        self.settings_service.set_google_credentials_path(credentials_path)
+        if credentials_path:
+            self.logger.info("Saved Google credentials path: %s", credentials_path)
 
     def _choose_folder(self) -> None:
         current = self.folder_path_edit.text().strip()
@@ -179,6 +312,7 @@ class MainWindow(QMainWindow):
     def refresh_files(self) -> None:
         folder_path = self.folder_path_edit.text().strip()
         self.file_list.clear()
+        self.file_preview.clear()
         self.upload_button.setEnabled(False)
 
         if not folder_path:
@@ -199,6 +333,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(file_path.name)
             item.setData(Qt.UserRole, str(file_path))
             self.file_list.addItem(item)
+
+        if self.file_list.count() > 0:
+            self.file_list.setCurrentRow(0)
+            self._update_file_preview()
 
         if files:
             self._set_status(f"Loaded {len(files)} file(s).", is_error=False)
@@ -224,10 +362,180 @@ class MainWindow(QMainWindow):
         self.upload_button.setEnabled(self.file_list.currentItem() is not None and self._upload_thread is None)
 
     def _current_selected_file(self) -> str | None:
-        item = self.file_list.currentItem()
+        selected_items = self.file_list.selectedItems()
+        item = selected_items[0] if selected_items else self.file_list.currentItem()
         if item is None:
             return None
         return item.data(Qt.UserRole)
+
+    def _update_file_preview(
+        self,
+        current: QListWidgetItem | None = None,
+        previous: QListWidgetItem | None = None,
+    ) -> None:
+        del previous
+
+        selected_items = self.file_list.selectedItems()
+        selected_item = selected_items[0] if selected_items else current or self.file_list.currentItem()
+        if selected_item is None:
+            self.file_preview.clear()
+            return
+
+        file_path = selected_item.data(Qt.UserRole)
+        if not file_path:
+            self.file_preview.clear()
+            return
+
+        path = Path(file_path)
+        try:
+            preview_text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            preview_text = f"Preview unavailable: {exc}"
+
+        self.file_preview.setPlainText(preview_text)
+        self.logger.info("Preview updated for %s", path)
+
+    def _choose_google_credentials(self) -> None:
+        current = self.google_credentials_edit.text().strip()
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Google OAuth Client JSON",
+            current or "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not selected:
+            return
+
+        self.google_credentials_edit.setText(selected)
+        self._save_google_credentials_path()
+
+    def _connect_google_drive(self) -> None:
+        credentials_path = self.google_credentials_edit.text().strip()
+        if not credentials_path:
+            self._set_google_drive_status("Select a Google OAuth credentials JSON file first.", is_error=True)
+            return
+
+        self._save_google_credentials_path()
+        try:
+            self.google_drive_service.connect(credentials_path)
+            drives = self.google_drive_service.list_drives()
+        except Exception as exc:
+            self.logger.exception("Google Drive connection failed.")
+            self._set_google_drive_status(f"Google Drive connection failed: {exc}", is_error=True)
+            return
+
+        self.google_drive_combo.blockSignals(True)
+        self.google_drive_combo.clear()
+        for drive in drives:
+            label = drive.name if not drive.is_shared_drive else f"{drive.name} (Shared Drive)"
+            self.google_drive_combo.addItem(label, drive)
+        self.google_drive_combo.blockSignals(False)
+
+        self.google_drive_combo.setEnabled(True)
+        self.google_refresh_button.setEnabled(True)
+
+        desired_drive_id = self.settings_service.get_google_selected_drive_id()
+        selected_index = 0
+        for index in range(self.google_drive_combo.count()):
+            drive = self.google_drive_combo.itemData(index)
+            if isinstance(drive, DriveOption) and drive.id == desired_drive_id:
+                selected_index = index
+                break
+
+        self.google_drive_combo.setCurrentIndex(selected_index)
+        self._google_drive_changed(selected_index)
+        self.logger.info("Connected to Google Drive.")
+        self._set_google_drive_status("Connected to Google Drive.", is_error=False)
+
+    def _google_drive_changed(self, index: int) -> None:
+        drive = self.google_drive_combo.itemData(index)
+        if not isinstance(drive, DriveOption):
+            return
+
+        self.google_current_drive = drive
+        self.google_folder_stack = [(drive.id, drive.name)]
+        self.settings_service.set_google_selected_drive_id(drive.id)
+        self._refresh_google_drive_items()
+
+    def _refresh_google_drive_items(self) -> None:
+        if self.google_current_drive is None:
+            return
+
+        folder_id, _ = self.google_folder_stack[-1]
+        self.google_drive_list.clear()
+        self.google_drive_preview.clear()
+
+        try:
+            items = self.google_drive_service.list_folder_items(self.google_current_drive, folder_id)
+        except Exception as exc:
+            self.logger.exception("Failed to load Google Drive items.")
+            self._set_google_drive_status(f"Failed to load Google Drive items: {exc}", is_error=True)
+            return
+
+        for item in items:
+            prefix = "[Folder] " if item.is_folder else ""
+            list_item = QListWidgetItem(f"{prefix}{item.name}")
+            list_item.setData(Qt.UserRole, item)
+            self.google_drive_list.addItem(list_item)
+
+        if self.google_drive_list.count() > 0:
+            self.google_drive_list.setCurrentRow(0)
+            self._update_google_drive_preview()
+
+        path_text = " / ".join(name for _, name in self.google_folder_stack)
+        self.google_folder_label.setText(f"Folder: {path_text}")
+        self.google_up_button.setEnabled(len(self.google_folder_stack) > 1)
+        self._set_google_drive_status(f"Loaded {len(items)} Google Drive item(s).", is_error=False)
+        self.logger.info("Loaded %s Google Drive item(s) from %s", len(items), path_text)
+
+    def _google_navigate_up(self) -> None:
+        if len(self.google_folder_stack) <= 1:
+            return
+
+        self.google_folder_stack.pop()
+        self._refresh_google_drive_items()
+
+    def _handle_google_drive_item_double_clicked(self, item: QListWidgetItem) -> None:
+        drive_item = item.data(Qt.UserRole)
+        if not isinstance(drive_item, DriveItem):
+            return
+
+        if not drive_item.is_folder:
+            return
+
+        self.google_folder_stack.append((drive_item.id, drive_item.name))
+        self._refresh_google_drive_items()
+
+    def _update_google_drive_preview(
+        self,
+        current: QListWidgetItem | None = None,
+        previous: QListWidgetItem | None = None,
+    ) -> None:
+        del previous
+
+        selected_items = self.google_drive_list.selectedItems()
+        selected_item = selected_items[0] if selected_items else current or self.google_drive_list.currentItem()
+        if selected_item is None:
+            self.google_drive_preview.clear()
+            return
+
+        drive_item = selected_item.data(Qt.UserRole)
+        if not isinstance(drive_item, DriveItem):
+            self.google_drive_preview.clear()
+            return
+
+        try:
+            preview_text = self.google_drive_service.get_preview_text(drive_item)
+        except Exception as exc:
+            preview_text = f"Preview unavailable: {exc}"
+
+        self.google_drive_preview.setPlainText(preview_text)
+        self.logger.info("Google Drive preview updated for %s", drive_item.name)
+
+    def _set_google_drive_status(self, message: str, *, is_error: bool) -> None:
+        color = "#9b1c1c" if is_error else "#1f4d2e"
+        self.google_drive_status_label.setStyleSheet(f"color: {color};")
+        self.google_drive_status_label.setText(message)
 
     def _start_upload(self) -> None:
         file_path = self._current_selected_file()
@@ -295,5 +603,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.settings_service.set_window_geometry(self.saveGeometry())
+        self.settings_service.set_files_splitter_state(self.files_splitter.saveState())
+        self.settings_service.set_google_drive_splitter_state(self.google_drive_splitter.saveState())
         self.logger.info("Application exiting cleanly. Version %s", __version__)
         super().closeEvent(event)

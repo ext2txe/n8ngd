@@ -4,9 +4,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QStandardPaths, Signal
+from PySide6.QtCore import QObject, Signal
 
 from n8ngd import APP_NAME
+from n8ngd.app_paths import get_app_data_directory
 
 
 class LogEmitter(QObject):
@@ -24,15 +25,7 @@ class QtLogHandler(logging.Handler):
 
 
 def get_log_directory() -> Path:
-    app_data_dir = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
-    if not app_data_dir:
-        app_data_dir = str(Path.home() / f".{APP_NAME}")
-
-    app_data_path = Path(app_data_dir)
-    if app_data_path.name.lower() != APP_NAME.lower():
-        app_data_path = app_data_path / APP_NAME
-
-    log_dir = app_data_path / "log"
+    log_dir = get_app_data_directory() / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
