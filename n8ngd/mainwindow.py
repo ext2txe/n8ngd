@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
@@ -14,13 +15,16 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from n8ngd import __version__
 from n8ngd.file_service import list_files, normalize_folder_path
+from n8ngd.logging_service import LogEmitter
 from n8ngd.settings_service import SettingsService
 from n8ngd.upload_service import UploadResult, upload_file, validate_webhook_url
 
@@ -39,8 +43,11 @@ class UploadWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, logger: logging.Logger, log_emitter: LogEmitter, log_file_path: Path) -> None:
         super().__init__()
+        self.logger = logger
+        self.log_emitter = log_emitter
+        self.log_file_path = log_file_path
         self.settings_service = SettingsService()
         self._upload_thread: QThread | None = None
         self._upload_worker: UploadWorker | None = None
@@ -51,14 +58,18 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.files_tab = QWidget()
         self.settings_tab = QWidget()
+        self.log_tab = QWidget()
 
         self._build_files_tab()
         self._build_settings_tab()
+        self._build_log_tab()
 
         self.tabs.addTab(self.files_tab, "Files")
         self.tabs.addTab(self.settings_tab, "Settings")
+        self.tabs.addTab(self.log_tab, "Log")
         self.setCentralWidget(self.tabs)
 
+        self.log_emitter.message_logged.connect(self._append_log_message)
         self._load_settings()
 
     def _build_files_tab(self) -> None:
@@ -115,6 +126,26 @@ class MainWindow(QMainWindow):
 
         self.n8n_url_edit.editingFinished.connect(self._save_webhook_url)
 
+    def _build_log_tab(self) -> None:
+        layout = QVBoxLayout()
+
+        controls_layout = QHBoxLayout()
+        self.clear_log_view_button = QPushButton("Clear View")
+        self.open_log_file_button = QPushButton("View Log File")
+        controls_layout.addWidget(self.clear_log_view_button)
+        controls_layout.addWidget(self.open_log_file_button)
+        controls_layout.addStretch(1)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+
+        layout.addLayout(controls_layout)
+        layout.addWidget(self.log_view, stretch=1)
+        self.log_tab.setLayout(layout)
+
+        self.clear_log_view_button.clicked.connect(self.log_view.clear)
+        self.open_log_file_button.clicked.connect(self._open_log_file)
+
     def _load_settings(self) -> None:
         last_folder = self.settings_service.get_last_folder_path()
         webhook_url = self.settings_service.get_n8n_webhook_url()
@@ -124,10 +155,16 @@ class MainWindow(QMainWindow):
             self.refresh_files()
 
     def _save_folder_path(self) -> None:
-        self.settings_service.set_last_folder_path(self.folder_path_edit.text().strip())
+        folder_path = self.folder_path_edit.text().strip()
+        self.settings_service.set_last_folder_path(folder_path)
+        if folder_path:
+            self.logger.info("Saved folder path: %s", folder_path)
 
     def _save_webhook_url(self) -> None:
-        self.settings_service.set_n8n_webhook_url(self.n8n_url_edit.text().strip())
+        webhook_url = self.n8n_url_edit.text().strip()
+        self.settings_service.set_n8n_webhook_url(webhook_url)
+        if webhook_url:
+            self.logger.info("Saved N8N webhook URL.")
 
     def _choose_folder(self) -> None:
         current = self.folder_path_edit.text().strip()
@@ -136,6 +173,7 @@ class MainWindow(QMainWindow):
             return
         self.folder_path_edit.setText(selected)
         self._save_folder_path()
+        self.logger.info("Selected folder: %s", selected)
         self.refresh_files()
 
     def refresh_files(self) -> None:
@@ -150,10 +188,12 @@ class MainWindow(QMainWindow):
         try:
             files = list_files(folder_path)
         except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+            self.logger.error("Failed to load files from %s: %s", folder_path, exc)
             self._set_status(str(exc), is_error=True)
             return
 
         self._save_folder_path()
+        self.logger.info("Loaded %s file(s) from %s", len(files), folder_path)
 
         for file_path in files:
             item = QListWidgetItem(file_path.name)
@@ -174,9 +214,11 @@ class MainWindow(QMainWindow):
         folder_path = normalize_folder_path(folder_text)
         if not folder_path.exists() or not folder_path.is_dir():
             self._set_status(f"Folder is not available: {folder_path}", is_error=True)
+            self.logger.error("Open folder failed, path unavailable: %s", folder_path)
             return
 
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder_path)))
+        self.logger.info("Opened folder: %s", folder_path)
 
     def _update_upload_state(self) -> None:
         self.upload_button.setEnabled(self.file_list.currentItem() is not None and self._upload_thread is None)
@@ -209,6 +251,7 @@ class MainWindow(QMainWindow):
         self._save_webhook_url()
         self.upload_button.setEnabled(False)
         self._set_status(f"Uploading {Path(file_path).name}...", is_error=False)
+        self.logger.info("Starting upload for %s", file_path)
 
         self._upload_thread = QThread(self)
         self._upload_worker = UploadWorker(file_path, webhook_url)
@@ -224,6 +267,10 @@ class MainWindow(QMainWindow):
     def _finish_upload(self, result: UploadResult) -> None:
         self._set_status(result.message, is_error=not result.success)
         if result.success:
+            self.logger.info("Upload finished successfully. %s", result.message)
+        else:
+            self.logger.error("Upload failed. %s", result.message)
+        if result.success:
             QMessageBox.information(self, "Upload Complete", result.message)
 
     def _clear_upload_refs(self) -> None:
@@ -231,7 +278,22 @@ class MainWindow(QMainWindow):
         self._upload_thread = None
         self._update_upload_state()
 
+    def _append_log_message(self, message: str) -> None:
+        self.log_view.appendPlainText(message)
+
+    def _open_log_file(self) -> None:
+        if not self.log_file_path.exists():
+            self.logger.error("Log file is not available yet: %s", self.log_file_path)
+            return
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_file_path)))
+        self.logger.info("Opened log file: %s", self.log_file_path)
+
     def _set_status(self, message: str, *, is_error: bool) -> None:
         color = "#9b1c1c" if is_error else "#1f4d2e"
         self.status_label.setStyleSheet(f"color: {color};")
         self.status_label.setText(message)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.logger.info("Application exiting cleanly. Version %s", __version__)
+        super().closeEvent(event)
