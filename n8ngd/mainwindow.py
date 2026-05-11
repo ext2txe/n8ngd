@@ -81,6 +81,7 @@ class MainWindow(QMainWindow):
         self._upload_worker: UploadWorker | None = None
         self._google_connect_thread: QThread | None = None
         self._google_connect_worker: GoogleDriveConnectWorker | None = None
+        self._retry_google_connect_after_token_reset = False
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(760, 520)
@@ -535,12 +536,16 @@ class MainWindow(QMainWindow):
     def _fail_google_drive_connect(self, error_message: str) -> None:
         self.logger.error("Google Drive connection failed. %s", error_message)
         self._set_google_drive_status(f"Google Drive connection failed: {error_message}", is_error=True)
+        self._offer_google_token_reset(error_message)
 
     def _clear_google_connect_refs(self) -> None:
         self._google_connect_worker = None
         self._google_connect_thread = None
         self.google_connect_button.setEnabled(True)
         self.google_credentials_browse_button.setEnabled(True)
+        if self._retry_google_connect_after_token_reset:
+            self._retry_google_connect_after_token_reset = False
+            self._connect_google_drive()
 
     def _google_drive_changed(self, index: int) -> None:
         drive = self.google_drive_combo.itemData(index)
@@ -631,6 +636,34 @@ class MainWindow(QMainWindow):
         color = "#9b1c1c" if is_error else "#1f4d2e"
         self.google_drive_status_label.setStyleSheet(f"color: {color};")
         self.google_drive_status_label.setText(message)
+
+    def _offer_google_token_reset(self, error_message: str) -> None:
+        if "invalid_grant" not in error_message or not self.google_drive_service.has_token():
+            return
+
+        token_path = self.google_drive_service.get_token_path()
+        response = QMessageBox.question(
+            self,
+            "Google Drive Token Expired",
+            "The saved Google Drive token is no longer valid.\n\n"
+            f"Delete the stored token and sign in again?\n\n{token_path}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if response != QMessageBox.Yes:
+            self.logger.info("User declined deletion of expired Google Drive token: %s", token_path)
+            return
+
+        try:
+            self.google_drive_service.delete_token()
+        except OSError as exc:
+            self.logger.error("Failed to delete Google Drive token %s: %s", token_path, exc)
+            self._set_google_drive_status(f"Failed to delete Google Drive token: {exc}", is_error=True)
+            return
+
+        self.logger.info("Deleted expired Google Drive token after user confirmation: %s", token_path)
+        self._set_google_drive_status("Deleted expired Google Drive token. Restarting sign-in...", is_error=False)
+        self._retry_google_connect_after_token_reset = True
 
     def _start_upload(self) -> None:
         file_path = self._current_selected_file()

@@ -68,6 +68,17 @@ class GoogleDriveService:
             return ""
         return f"Google Drive support is unavailable: {GOOGLE_DRIVE_IMPORT_ERROR}"
 
+    def get_token_path(self) -> Path:
+        return self._get_token_path()
+
+    def has_token(self) -> bool:
+        return self.get_token_path().exists()
+
+    def delete_token(self) -> None:
+        token_path = self.get_token_path()
+        if token_path.exists():
+            token_path.unlink()
+
     def connect(self, credentials_path: str) -> None:
         self._ensure_dependencies_available()
         credentials_file = Path(credentials_path)
