@@ -10,7 +10,7 @@
       "cwd": "${workspaceFolder}",
       "args": [
         "${workspaceFolder}/j2gtest/j2gincoming",
-        "/upwork"
+        "/upwork2"
       ]
     }
   ]

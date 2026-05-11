@@ -1,0 +1,15 @@
+{
+  "version": "0.1.12",
+  "exportDate": "2026-05-06T08:18:35.586Z",
+  "keywords": [
+    "India",
+    "IND"
+  ],
+  "urlPatterns": [
+    "*://www.upwork.com/nx/find-work/*",
+    "*://www.upwork.com/nx/search/jobs/*"
+  ],
+  "highlightColor": "#ffb9b9",
+  "elementSelector": "article, .job, .listing, section",
+  "useWordBoundaries": true
+}
