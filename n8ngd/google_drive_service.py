@@ -12,6 +12,7 @@ try:
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
     from googleapiclient.http import MediaIoBaseDownload
 
     GOOGLE_DRIVE_IMPORT_ERROR: Exception | None = None
@@ -20,6 +21,7 @@ except ImportError as exc:
     Credentials = None
     InstalledAppFlow = None
     build = None
+    MediaFileUpload = None
     MediaIoBaseDownload = None
     GOOGLE_DRIVE_IMPORT_ERROR = exc
 
@@ -143,6 +145,41 @@ class GoogleDriveService:
             for file in response.get("files", [])
         ]
 
+    def ensure_folder_path(self, folder_path: str) -> str:
+        self._ensure_dependencies_available()
+        self._ensure_connected()
+
+        normalized_parts = [part for part in folder_path.replace("\\", "/").split("/") if part]
+        parent_id = "root"
+        for part in normalized_parts:
+            existing_id = self._find_child_folder_id(parent_id, part)
+            if existing_id is None:
+                existing_id = self._create_folder(parent_id, part)
+            parent_id = existing_id
+
+        return parent_id
+
+    def upload_file_to_folder(self, file_path: Path | str, folder_id: str) -> str:
+        self._ensure_dependencies_available()
+        self._ensure_connected()
+
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"File does not exist: {path}")
+
+        media = MediaFileUpload(str(path), resumable=False)
+        metadata = {
+            "name": path.name,
+            "parents": [folder_id],
+        }
+        created = self._service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        return str(created["id"])
+
     def get_preview_text(self, item: DriveItem, *, max_bytes: int = 512_000) -> str:
         self._ensure_dependencies_available()
         self._ensure_connected()
@@ -224,6 +261,39 @@ class GoogleDriveService:
     def _ensure_dependencies_available(self) -> None:
         if GOOGLE_DRIVE_IMPORT_ERROR is not None:
             raise RuntimeError(self.get_unavailable_reason())
+
+    def _find_child_folder_id(self, parent_id: str, folder_name: str) -> str | None:
+        escaped_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+        query = (
+            f"'{parent_id}' in parents and "
+            f"name = '{escaped_name}' and "
+            f"mimeType = '{FOLDER_MIME_TYPE}' and trashed = false"
+        )
+        response = self._service.files().list(
+            q=query,
+            pageSize=1,
+            spaces="drive",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            fields="files(id,name)",
+        ).execute()
+        files = response.get("files", [])
+        if not files:
+            return None
+        return str(files[0]["id"])
+
+    def _create_folder(self, parent_id: str, folder_name: str) -> str:
+        metadata = {
+            "name": folder_name,
+            "mimeType": FOLDER_MIME_TYPE,
+            "parents": [parent_id],
+        }
+        created = self._service.files().create(
+            body=metadata,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        return str(created["id"])
 
     def _get_token_path(self) -> Path:
         return get_app_data_directory() / "google_drive_token.json"
