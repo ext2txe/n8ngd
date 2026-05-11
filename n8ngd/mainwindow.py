@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
 
         self.log_emitter.message_logged.connect(self._append_log_message)
         self._load_settings()
+        self._apply_google_drive_availability()
 
     def _build_files_tab(self) -> None:
         layout = QVBoxLayout()
@@ -336,6 +337,23 @@ class MainWindow(QMainWindow):
         if credentials_path:
             self.logger.info("Saved Google credentials path: %s", credentials_path)
 
+    def _apply_google_drive_availability(self) -> None:
+        if self.google_drive_service.is_available:
+            return
+
+        reason = self.google_drive_service.get_unavailable_reason()
+        self.google_credentials_edit.setEnabled(False)
+        self.google_credentials_browse_button.setEnabled(False)
+        self.google_connect_button.setEnabled(False)
+        self.google_drive_combo.setEnabled(False)
+        self.google_refresh_button.setEnabled(False)
+        self.google_up_button.setEnabled(False)
+        self.google_drive_list.setEnabled(False)
+        self.google_drive_preview.setPlainText(reason)
+        self.google_folder_label.setText("Folder: Google Drive unavailable")
+        self._set_google_drive_status(reason, is_error=True)
+        self.logger.warning(reason)
+
     def _save_font_size(self, font_size: int) -> None:
         self.settings_service.set_font_size(font_size)
         self._apply_font_size(font_size)
@@ -452,6 +470,10 @@ class MainWindow(QMainWindow):
         self._save_google_credentials_path()
 
     def _connect_google_drive(self) -> None:
+        if not self.google_drive_service.is_available:
+            self._set_google_drive_status(self.google_drive_service.get_unavailable_reason(), is_error=True)
+            return
+
         credentials_path = self.google_credentials_edit.text().strip()
         if not credentials_path:
             self._set_google_drive_status("Select a Google OAuth credentials JSON file first.", is_error=True)

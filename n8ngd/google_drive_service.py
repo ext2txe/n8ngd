@@ -5,14 +5,23 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
-
 from n8ngd.app_paths import get_app_data_directory
+
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+
+    GOOGLE_DRIVE_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:
+    Request = None
+    Credentials = None
+    InstalledAppFlow = None
+    build = None
+    MediaIoBaseDownload = None
+    GOOGLE_DRIVE_IMPORT_ERROR = exc
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -50,7 +59,17 @@ class GoogleDriveService:
     def is_connected(self) -> bool:
         return self._service is not None
 
+    @property
+    def is_available(self) -> bool:
+        return GOOGLE_DRIVE_IMPORT_ERROR is None
+
+    def get_unavailable_reason(self) -> str:
+        if GOOGLE_DRIVE_IMPORT_ERROR is None:
+            return ""
+        return f"Google Drive support is unavailable: {GOOGLE_DRIVE_IMPORT_ERROR}"
+
     def connect(self, credentials_path: str) -> None:
+        self._ensure_dependencies_available()
         credentials_file = Path(credentials_path)
         if not credentials_file.exists():
             raise FileNotFoundError(f"Google credentials file does not exist: {credentials_file}")
@@ -72,6 +91,7 @@ class GoogleDriveService:
         self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
     def list_drives(self) -> list[DriveOption]:
+        self._ensure_dependencies_available()
         self._ensure_connected()
 
         drives = [DriveOption(id="root", name="My Drive", is_shared_drive=False)]
@@ -82,6 +102,7 @@ class GoogleDriveService:
         return drives
 
     def list_folder_items(self, drive: DriveOption, folder_id: str) -> list[DriveItem]:
+        self._ensure_dependencies_available()
         self._ensure_connected()
 
         request_kwargs = {
@@ -112,6 +133,7 @@ class GoogleDriveService:
         ]
 
     def get_preview_text(self, item: DriveItem, *, max_bytes: int = 512_000) -> str:
+        self._ensure_dependencies_available()
         self._ensure_connected()
 
         if item.is_folder:
@@ -141,6 +163,7 @@ class GoogleDriveService:
         return self._decode_preview(item, content)
 
     def get_folder_name(self, item_id: str) -> str:
+        self._ensure_dependencies_available()
         self._ensure_connected()
         response = self._service.files().get(
             fileId=item_id,
@@ -186,6 +209,10 @@ class GoogleDriveService:
     def _ensure_connected(self) -> None:
         if self._service is None:
             raise RuntimeError("Google Drive is not connected.")
+
+    def _ensure_dependencies_available(self) -> None:
+        if GOOGLE_DRIVE_IMPORT_ERROR is not None:
+            raise RuntimeError(self.get_unavailable_reason())
 
     def _get_token_path(self) -> Path:
         return get_app_data_directory() / "google_drive_token.json"
