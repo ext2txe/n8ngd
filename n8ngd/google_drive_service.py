@@ -56,6 +56,7 @@ class DriveItem:
 class GoogleDriveService:
     def __init__(self) -> None:
         self._service = None
+        self._token_path_override: Path | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -71,7 +72,12 @@ class GoogleDriveService:
         return f"Google Drive support is unavailable: {GOOGLE_DRIVE_IMPORT_ERROR}"
 
     def get_token_path(self) -> Path:
+        if self._token_path_override is not None:
+            return self._token_path_override
         return self._get_token_path()
+
+    def set_token_path(self, token_path: Path | str | None) -> None:
+        self._token_path_override = None if token_path is None else Path(token_path)
 
     def has_token(self) -> bool:
         return self.get_token_path().exists()
@@ -81,13 +87,13 @@ class GoogleDriveService:
         if token_path.exists():
             token_path.unlink()
 
-    def connect(self, credentials_path: str) -> None:
+    def connect(self, credentials_path: str, *, interactive: bool = True) -> None:
         self._ensure_dependencies_available()
         credentials_file = Path(credentials_path)
         if not credentials_file.exists():
             raise FileNotFoundError(f"Google credentials file does not exist: {credentials_file}")
 
-        token_path = self._get_token_path()
+        token_path = self.get_token_path()
         token_path.parent.mkdir(parents=True, exist_ok=True)
 
         creds: Credentials | None = None
@@ -97,6 +103,10 @@ class GoogleDriveService:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         elif not creds or not creds.valid:
+            if not interactive:
+                raise RuntimeError(
+                    f"Google Drive token is not available for non-interactive use: {token_path}"
+                )
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
             creds = flow.run_local_server(port=0)
 

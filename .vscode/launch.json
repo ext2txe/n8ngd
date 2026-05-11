@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug process-jobs.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/jobs2google/process-jobs.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "${workspaceFolder}/j2gtest/j2gincoming",
+        "/upwork"
+      ]
+    }
+  ]
+}

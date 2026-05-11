@@ -1,2 +1,2 @@
 APP_NAME = "n8ngd"
-__version__ = "0.1.21"
+__version__ = "0.1.29"

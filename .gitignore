@@ -5,3 +5,7 @@ __pycache__/
 
 client_secret_*.json
 cred.json
+
+
+j2gtest/
+j2gtest/*

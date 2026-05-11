@@ -19,6 +19,7 @@ from n8ngd.google_drive_service import GoogleDriveService
 
 APP_NAME = "jobs2google"
 DEFAULT_FILE_PATTERNS = ["*"]
+PROCESSED_JOB_IDS_FILE_NAME = "processed_job_ids.json"
 
 
 class ArgumentParserError(ValueError):
@@ -51,6 +52,14 @@ def get_log_file_path() -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     date_prefix = datetime.now().strftime("%Y%m%d")
     return log_dir / f"{date_prefix}-{APP_NAME}.log"
+
+
+def get_token_file_path() -> Path:
+    return get_app_data_directory() / "google_drive_token.json"
+
+
+def get_processed_job_ids_path() -> Path:
+    return get_app_data_directory() / PROCESSED_JOB_IDS_FILE_NAME
 
 
 def configure_logging() -> tuple[logging.Logger, Path]:
@@ -142,6 +151,43 @@ def load_keyword_settings(config_path: Path) -> tuple[list[str], list[str]]:
     return keywords, file_patterns
 
 
+def extract_job_id(file_path: Path) -> str | None:
+    stem = file_path.stem.strip()
+    if not stem:
+        return None
+
+    _, separator, remainder = stem.partition("_")
+    if not separator or not remainder:
+        return None
+
+    job_id = remainder.strip()
+    return job_id or None
+
+
+def load_processed_job_ids(processed_job_ids_path: Path) -> set[str]:
+    if not processed_job_ids_path.exists():
+        return set()
+
+    raw_data = json.loads(processed_job_ids_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_data, dict):
+        raise ValueError("processed_job_ids.json must contain a JSON object.")
+
+    raw_job_ids = raw_data.get("job_ids", [])
+    if not isinstance(raw_job_ids, list) or not all(isinstance(item, str) for item in raw_job_ids):
+        raise ValueError("processed_job_ids.json must contain a 'job_ids' array of strings.")
+
+    return {item.strip() for item in raw_job_ids if item.strip()}
+
+
+def save_processed_job_ids(processed_job_ids_path: Path, processed_job_ids: set[str]) -> None:
+    processed_job_ids_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "job_ids": sorted(processed_job_ids),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    processed_job_ids_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def discover_credentials_path(repo_root: Path) -> Path:
     env_candidates = [
         os.getenv("JOBS2GOOGLE_GOOGLE_CREDENTIALS"),
@@ -176,6 +222,16 @@ def iter_source_files(source_path: Path, file_patterns: list[str]) -> list[Path]
     return sorted(filtered, key=lambda item: item.name.lower())
 
 
+def iter_processed_files(source_path: Path) -> list[Path]:
+    files: list[Path] = []
+    for subfolder_name in ("rejected", "prospects"):
+        subfolder_path = source_path / subfolder_name
+        if not subfolder_path.exists():
+            continue
+        files.extend(entry for entry in subfolder_path.iterdir() if entry.is_file())
+    return files
+
+
 def find_matching_keywords(file_path: Path, keywords: list[str]) -> list[str]:
     content = file_path.read_text(encoding="utf-8", errors="replace").lower()
     matches = [keyword for keyword in keywords if keyword.lower() in content]
@@ -202,13 +258,38 @@ def move_file_to_subfolder(file_path: Path, subfolder_name: str) -> Path:
         counter += 1
 
 
+def find_existing_processed_file(file_path: Path) -> Path | None:
+    for subfolder_name in ("rejected", "prospects"):
+        existing_path = file_path.parent / subfolder_name / file_path.name
+        if existing_path.exists():
+            return existing_path
+    return None
+
+
+def build_processed_job_index(source_path: Path) -> dict[str, Path]:
+    processed_files = iter_processed_files(source_path)
+    job_index: dict[str, Path] = {}
+    for processed_file in processed_files:
+        job_id = extract_job_id(processed_file)
+        if job_id is None:
+            continue
+        job_index.setdefault(job_id, processed_file)
+    return job_index
+
+
 def process_jobs(source_path: Path, destination_path: str, logger: logging.Logger) -> int:
     config_path = Path(__file__).resolve().parent / "keywords.json"
     keywords, file_patterns = load_keyword_settings(config_path)
     files = iter_source_files(source_path, file_patterns)
+    processed_job_ids_path = get_processed_job_ids_path()
+    tracked_job_ids = load_processed_job_ids(processed_job_ids_path)
+    processed_job_index = build_processed_job_index(source_path)
+    known_job_ids = tracked_job_ids | set(processed_job_index)
 
     logger.info("Loaded %s keyword(s) from %s", len(keywords), config_path)
     logger.info("Found %s top-level file(s) to process in %s", len(files), source_path)
+    logger.info("Loaded %s tracked processed job id(s) from %s", len(tracked_job_ids), processed_job_ids_path)
+    logger.info("Indexed %s processed file job id(s) from prospects/rejected folders", len(processed_job_index))
 
     if not files:
         logger.info("No files matched the configured patterns. Nothing to do.")
@@ -218,16 +299,51 @@ def process_jobs(source_path: Path, destination_path: str, logger: logging.Logge
     logger.info("Using Google credentials file: %s", credentials_path)
 
     drive_service = GoogleDriveService()
-    drive_service.connect(str(credentials_path))
+    token_path = get_token_file_path()
+    drive_service.set_token_path(token_path)
+    logger.info("Using Google Drive token file: %s", token_path)
+    drive_service.connect(str(credentials_path), interactive=False)
     destination_folder_id = drive_service.ensure_folder_path(destination_path)
     logger.info("Resolved Google Drive destination %s to folder id %s", destination_path, destination_folder_id)
 
     rejected_count = 0
     uploaded_count = 0
     failed_count = 0
+    duplicate_count = 0
 
     for file_path in files:
         logger.info("Processing file: %s", file_path.name)
+
+        job_id = extract_job_id(file_path)
+        existing_processed_file = find_existing_processed_file(file_path)
+        existing_processed_by_job_id = None if job_id is None else processed_job_index.get(job_id)
+        is_tracked_duplicate = job_id is not None and job_id in known_job_ids
+        if existing_processed_file is not None or existing_processed_by_job_id is not None or is_tracked_duplicate:
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                failed_count += 1
+                logger.error(
+                    "Duplicate incoming file %s could not be deleted: %s",
+                    file_path,
+                    exc,
+                )
+                continue
+
+            duplicate_reason = "tracked processed job id"
+            if existing_processed_by_job_id is not None:
+                duplicate_reason = f"existing processed job id match in {existing_processed_by_job_id}"
+            elif existing_processed_file is not None:
+                duplicate_reason = f"existing processed file {existing_processed_file}"
+
+            duplicate_count += 1
+            logger.info(
+                "Deleted duplicate incoming file %s because it matched %s",
+                file_path,
+                duplicate_reason,
+            )
+            continue
+
         try:
             matches = find_matching_keywords(file_path, keywords)
         except OSError as exc:
@@ -246,6 +362,10 @@ def process_jobs(source_path: Path, destination_path: str, logger: logging.Logge
             rejected_count += 1
             logger.info("Rejected %s due to keyword match(es): %s", file_path.name, ", ".join(matches))
             logger.info("Moved rejected file to %s", moved_path)
+            if job_id is not None:
+                known_job_ids.add(job_id)
+                processed_job_index.setdefault(job_id, moved_path)
+                save_processed_job_ids(processed_job_ids_path, known_job_ids)
             continue
 
         try:
@@ -265,10 +385,15 @@ def process_jobs(source_path: Path, destination_path: str, logger: logging.Logge
         uploaded_count += 1
         logger.info("Uploaded %s to Google Drive with id %s", file_path.name, file_id)
         logger.info("Moved uploaded file to %s", moved_path)
+        if job_id is not None:
+            known_job_ids.add(job_id)
+            processed_job_index.setdefault(job_id, moved_path)
+            save_processed_job_ids(processed_job_ids_path, known_job_ids)
 
     logger.info(
-        "Processing complete. scanned=%s rejected=%s uploaded=%s failed=%s",
+        "Processing complete. scanned=%s duplicates_deleted=%s rejected=%s uploaded=%s failed=%s",
         len(files),
+        duplicate_count,
         rejected_count,
         uploaded_count,
         failed_count,
@@ -295,6 +420,11 @@ def main() -> int:
         exit_code = 1
     except Exception:
         logger.exception("Job processing failed.")
+        print("jobs2google is non-interactive and will not open a browser for Google authorization.", file=sys.stderr)
+        print(
+            f"If needed, create or refresh the jobs2google token first: {get_token_file_path()}",
+            file=sys.stderr,
+        )
         print(f"Fatal error. See log file for details: {log_file_path}", file=sys.stderr)
         exit_code = 1
 
@@ -303,7 +433,3 @@ def main() -> int:
     else:
         logger.error("Application exiting with error. Version %s", __version__)
     return exit_code
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

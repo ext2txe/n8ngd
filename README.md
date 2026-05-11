@@ -38,3 +38,9 @@ Or use the helper script:
 ```powershell
 .\run.ps1
 ```
+
+To create a desktop shortcut that launches `run.ps1`:
+
+```powershell
+.\create-desktop-shortcut.ps1
+```
