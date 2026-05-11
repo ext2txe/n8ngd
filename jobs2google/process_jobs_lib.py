@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import html
 import json
 import logging
 import os
@@ -248,8 +249,21 @@ def build_keyword_pattern(keyword: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![A-Za-z0-9]){escaped_keyword}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
+def strip_html_tags(text: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
+
+
+def extract_matchable_text(document_text: str) -> str:
+    body_match = re.search(r"<body\b[^>]*>(.*)</body>", document_text, flags=re.IGNORECASE | re.DOTALL)
+    visible_html = body_match.group(1) if body_match else document_text
+    visible_html = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", visible_html, flags=re.IGNORECASE | re.DOTALL)
+    return strip_html_tags(visible_html)
+
+
 def find_matching_keywords(file_path: Path, keywords: list[str]) -> list[str]:
-    content = file_path.read_text(encoding="utf-8", errors="replace")
+    document_text = file_path.read_text(encoding="utf-8", errors="replace")
+    content = extract_matchable_text(document_text)
     matches = [keyword for keyword in keywords if build_keyword_pattern(keyword).search(content)]
     return matches
 

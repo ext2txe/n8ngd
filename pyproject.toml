@@ -1,6 +1,6 @@
 [project]
 name = "n8ngd"
-version = "0.1.30"
+version = "0.1.32"
 description = "PySide6 desktop tool for uploading files to n8n."
 readme = "README.md"
 requires-python = ">=3.10"
