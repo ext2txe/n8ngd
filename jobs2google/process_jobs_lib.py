@@ -5,6 +5,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -232,9 +233,24 @@ def iter_processed_files(source_path: Path) -> list[Path]:
     return files
 
 
+def keyword_uses_wildcards(keyword: str) -> bool:
+    return any(character in keyword for character in "*?[")
+
+
+def build_keyword_pattern(keyword: str) -> re.Pattern[str]:
+    if keyword_uses_wildcards(keyword):
+        wildcard_pattern = fnmatch.translate(keyword)
+        if wildcard_pattern.startswith("(?s:") and wildcard_pattern.endswith(")\\Z"):
+            wildcard_pattern = wildcard_pattern[4:-3]
+        return re.compile(wildcard_pattern, re.IGNORECASE)
+
+    escaped_keyword = re.escape(keyword)
+    return re.compile(rf"(?<![A-Za-z0-9]){escaped_keyword}(?![A-Za-z0-9])", re.IGNORECASE)
+
+
 def find_matching_keywords(file_path: Path, keywords: list[str]) -> list[str]:
-    content = file_path.read_text(encoding="utf-8", errors="replace").lower()
-    matches = [keyword for keyword in keywords if keyword.lower() in content]
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    matches = [keyword for keyword in keywords if build_keyword_pattern(keyword).search(content)]
     return matches
 
 
